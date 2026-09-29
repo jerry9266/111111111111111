@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const cloudinary = require('cloudinary').v2;
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -22,12 +24,134 @@ cloudinary.config({
     secure: true
 });
 
-app.get('/', (req, res) => {
-    res.json({ status: 'active', message: 'NaponTech Backend Server is running.' });
-});
+/* ==========================================================================
+   DYNAMIC OPEN GRAPH & TWITTER CARD PREVIEW SSR HANDLER
+   ========================================================================== */
+
+/**
+ * Escapes special HTML attribute characters to prevent meta tag injection breaks
+ */
+function escapeMetaAttr(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+/**
+ * Serves home.html with dynamically injected Open Graph & Twitter Cards
+ * if a ?post=POST_ID parameter is detected.
+ */
+async function handleDynamicSharePreview(req, res, next) {
+    const postId = req.query.post;
+
+    // Path to your local home.html file
+    const homeHtmlPath = path.join(__dirname, 'home.html');
+
+    // If home.html is not stored on this server folder or no post parameter is present, proceed normally
+    if (!postId || !fs.existsSync(homeHtmlPath)) {
+        return next();
+    }
+
+    try {
+        let html = fs.readFileSync(homeHtmlPath, 'utf8');
+
+        // Fetch assets from Cloudinary for this specific post ID
+        const [imgRes, vidRes] = await Promise.all([
+            cloudinary.api.resources({
+                type: 'upload',
+                prefix: `homepage_posts/${postId}`,
+                resource_type: 'image',
+                context: true,
+                max_results: 10
+            }).catch(() => ({ resources: [] })),
+            cloudinary.api.resources({
+                type: 'upload',
+                prefix: `homepage_posts/${postId}`,
+                resource_type: 'video',
+                context: true,
+                max_results: 5
+            }).catch(() => ({ resources: [] }))
+        ]);
+
+        const allRes = [...(imgRes.resources || []), ...(vidRes.resources || [])];
+
+        if (allRes.length > 0) {
+            const firstAsset = allRes[0];
+            const ctx = (firstAsset.context && firstAsset.context.custom) || {};
+
+            const postTitle = ctx.title || 'NaponTech | Build • Design • Develop';
+            const postDesc = ctx.description || 'Custom software development, web applications, and digital engineering solutions.';
+            
+            // Determine the preview image URL (for videos, use the Cloudinary auto-generated JPG poster thumbnail)
+            let previewImage = firstAsset.secure_url;
+            if (firstAsset.resource_type === 'video') {
+                previewImage = firstAsset.secure_url.replace(/\.[^/.]+$/, ".jpg");
+            }
+
+            // Construct canonical post URL
+            const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+            const host = req.get('host');
+            const canonicalUrl = `${protocol}://${host}/home.html?post=${encodeURIComponent(postId)}`;
+
+            // Build Social Media Open Graph & Twitter Meta tags
+            const dynamicMetaTags = `
+    <!-- Dynamic Open Graph Preview Tags (NaponTech) -->
+    <title>${escapeMetaAttr(postTitle)} | NaponTech</title>
+    <meta name="description" content="${escapeMetaAttr(postDesc)}">
+
+    <!-- Open Graph / Facebook / WhatsApp / Telegram / LinkedIn -->
+    <meta property="og:type" content="article">
+    <meta property="og:site_name" content="NaponTech">
+    <meta property="og:url" content="${escapeMetaAttr(canonicalUrl)}">
+    <meta property="og:title" content="${escapeMetaAttr(postTitle)}">
+    <meta property="og:description" content="${escapeMetaAttr(postDesc)}">
+    <meta property="og:image" content="${escapeMetaAttr(previewImage)}">
+    <meta property="og:image:secure_url" content="${escapeMetaAttr(previewImage)}">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="${escapeMetaAttr(postTitle)}">
+
+    <!-- Twitter / X Card Metadata -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:site" content="@napontech">
+    <meta name="twitter:title" content="${escapeMetaAttr(postTitle)}">
+    <meta name="twitter:description" content="${escapeMetaAttr(postDesc)}">
+    <meta name="twitter:image" content="${escapeMetaAttr(previewImage)}">
+`;
+
+            // Replace existing <title> and inject meta tags inside <head>
+            if (html.includes('</head>')) {
+                html = html.replace(/<title>.*?<\/title>/i, '');
+                html = html.replace('</head>', `${dynamicMetaTags}\n</head>`);
+            }
+
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            return res.send(html);
+        }
+
+        // If specific post was not found in Cloudinary, serve standard home.html
+        return res.sendFile(homeHtmlPath);
+
+    } catch (err) {
+        console.error('Error injecting dynamic preview meta:', err);
+        return res.sendFile(homeHtmlPath);
+    }
+}
+
+// Attach the dynamic meta tag handler to root and home.html routes
+app.get('/', handleDynamicSharePreview);
+app.get('/home.html', handleDynamicSharePreview);
+app.get('/index.html', handleDynamicSharePreview);
+
+// Serve static frontend files if hosted together on Render
+app.use(express.static(path.join(__dirname)));
 
 /* ==========================================================================
-   1. HOMEPAGE POSTS API (PRESERVED 100%)
+   1. HOMEPAGE CONTENT POSTS API
    ========================================================================== */
 
 app.post('/api/upload-post', async (req, res) => {
@@ -156,7 +280,7 @@ app.delete('/api/delete-post', async (req, res) => {
 });
 
 /* ==========================================================================
-   2. CONTACT / SUBMISSION FORMS (PRESERVED 100%)
+   2. FORM SUBMISSIONS SYSTEM
    ========================================================================== */
 
 function normalizeCategory(cat) {
@@ -308,7 +432,7 @@ app.get('/api/fetch-txt-content', async (req, res) => {
 });
 
 /* ==========================================================================
-   3. UPGRADED PROJECT TRACKING & CLIENT FEEDBACK (TXT-BASED CLOUDINARY)
+   3. CLIENT PROJECT TRACKING & FEEDBACK APIS
    ========================================================================== */
 
 app.post('/api/project/save', async (req, res) => {
@@ -388,7 +512,6 @@ ${milestonesJson}
         });
 
     } catch (err) {
-        console.error('Save Project Error:', err);
         return res.status(500).json({ success: false, error: 'Failed to save project: ' + err.message });
     }
 });
